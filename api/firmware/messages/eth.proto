@@ -43,6 +43,10 @@ message ETHPubRequest {
 }
 
 message ETHSignRequest {
+  enum TransactionType {
+    LEGACY = 0;
+    EIP1559 = 1;
+  }
   // Deprecated: use chain_id instead.
   ETHCoin coin = 1;
   repeated uint32 keypath = 2;
@@ -55,6 +59,8 @@ message ETHSignRequest {
   AntiKleptoHostNonceCommitment host_nonce_commitment = 9;
   // If non-zero, `coin` is ignored and `chain_id` is used to identify the network.
   uint64 chain_id = 10;
+  bytes max_fee_per_gas = 11; // smallest big endian serialization, max. 16 bytes
+  bytes max_priority_fee_per_gas = 12; // smallest big endian serialization, max. 16 bytes
 }
 
 message ETHSignMessageRequest {
