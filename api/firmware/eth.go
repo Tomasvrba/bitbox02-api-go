@@ -469,11 +469,25 @@ func (device *Device) nonAtomicETHSignMessage(
 	return signature, nil
 }
 
-func parseType(typ string, types map[string]interface{}) (*messages.ETHSignTypedMessageRequest_MemberType, error) {
+type ethTypedMessageMember struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+type ethTypedMessage struct {
+	Types       map[string][]ethTypedMessageMember `json:"types"`
+	PrimaryType string                             `json:"primaryType"`
+	Domain      map[string]interface{}             `json:"domain"`
+	Message     map[string]interface{}             `json:"message"`
+}
+
+func parseType(typ string, types map[string][]ethTypedMessageMember) (*messages.ETHSignTypedMessageRequest_MemberType, error) {
 	if strings.HasSuffix(typ, "]") {
 		index := strings.LastIndexByte(typ, '[')
-		typ = typ[:len(typ)-1]
-		rest, size := typ[:index], typ[index+1:]
+		if index < 0 {
+			return nil, errp.Newf("invalid array type: %s", typ)
+		}
+		rest, size := typ[:index], typ[index+1:len(typ)-1]
 		var sizeInt uint32
 		if size != "" {
 			i, err := strconv.ParseUint(size, 10, 32)
@@ -560,6 +574,39 @@ func parseType(typ string, types map[string]interface{}) (*messages.ETHSignTyped
 	return nil, errp.Newf("Can't recognize type: %s", typ)
 }
 
+func parseTypedMessage(jsonMsg []byte) (*ethTypedMessage, []*messages.ETHSignTypedMessageRequest_StructType, error) {
+	var msg ethTypedMessage
+	if err := json.Unmarshal(jsonMsg, &msg); err != nil {
+		return nil, nil, errp.WithStack(err)
+	}
+	if msg.Types == nil || msg.Domain == nil || msg.Message == nil {
+		return nil, nil, errp.New("typed data is missing required fields")
+	}
+
+	parsedTypes := make([]*messages.ETHSignTypedMessageRequest_StructType, 0, len(msg.Types))
+	for name, typeMembers := range msg.Types {
+		if typeMembers == nil {
+			return nil, nil, errp.New("typed data type members must be an array")
+		}
+		members := make([]*messages.ETHSignTypedMessageRequest_Member, 0, len(typeMembers))
+		for _, member := range typeMembers {
+			parsedType, err := parseType(member.Type, msg.Types)
+			if err != nil {
+				return nil, nil, err
+			}
+			members = append(members, &messages.ETHSignTypedMessageRequest_Member{
+				Name: member.Name,
+				Type: parsedType,
+			})
+		}
+		parsedTypes = append(parsedTypes, &messages.ETHSignTypedMessageRequest_StructType{
+			Name:    name,
+			Members: members,
+		})
+	}
+	return &msg, parsedTypes, nil
+}
+
 // Golang's stdlib doesn't support serializing signed integers in big endian (two's complement).
 // -x = ~x+1.
 func bigendianInt(integer *big.Int) []byte {
@@ -579,7 +626,10 @@ func bigendianInt(integer *big.Int) []byte {
 func encodeValue(typ *messages.ETHSignTypedMessageRequest_MemberType, value interface{}) ([]byte, error) {
 	switch typ.Type {
 	case messages.ETHSignTypedMessageRequest_BYTES:
-		v := value.(string)
+		v, ok := value.(string)
+		if !ok {
+			return nil, errp.Newf("expected bytes value to be a string, got %T", value)
+		}
 		if strings.HasPrefix(v, "0x") || strings.HasPrefix(v, "0X") {
 			return hex.DecodeString(v[2:])
 		}
@@ -628,14 +678,26 @@ func encodeValue(typ *messages.ETHSignTypedMessageRequest_MemberType, value inte
 		}
 		return bigendianInt(bigint), nil
 	case messages.ETHSignTypedMessageRequest_BOOL:
-		if value.(bool) {
+		v, ok := value.(bool)
+		if !ok {
+			return nil, errp.Newf("expected bool value, got %T", value)
+		}
+		if v {
 			return []byte{1}, nil
 		}
 		return []byte{0}, nil
 	case messages.ETHSignTypedMessageRequest_ADDRESS, messages.ETHSignTypedMessageRequest_STRING:
-		return []byte(value.(string)), nil
+		v, ok := value.(string)
+		if !ok {
+			return nil, errp.Newf("expected string value, got %T", value)
+		}
+		return []byte(v), nil
 	case messages.ETHSignTypedMessageRequest_ARRAY:
-		size := uint32(len(value.([]interface{})))
+		v, ok := value.([]interface{})
+		if !ok {
+			return nil, errp.Newf("expected array value, got %T", value)
+		}
+		size := uint32(len(v))
 		result := make([]byte, 4)
 		binary.BigEndian.PutUint32(result, size)
 		return result, nil
@@ -646,25 +708,23 @@ func encodeValue(typ *messages.ETHSignTypedMessageRequest_MemberType, value inte
 
 func getValue(
 	what *messages.ETHTypedMessageValueResponse,
-	msg map[string]interface{},
+	msg *ethTypedMessage,
 ) ([]byte, messages.ETHSignTypedMessageRequest_DataType, error) {
-	types := msg["types"].(map[string]interface{})
-
 	var value interface{}
 	var typ *messages.ETHSignTypedMessageRequest_MemberType
 
 	switch what.RootObject {
 	case messages.ETHTypedMessageValueResponse_DOMAIN:
-		value = msg["domain"]
+		value = msg.Domain
 		var err error
-		typ, err = parseType("EIP712Domain", types)
+		typ, err = parseType("EIP712Domain", msg.Types)
 		if err != nil {
 			return nil, messages.ETHSignTypedMessageRequest_UNKNOWN, err
 		}
 	case messages.ETHTypedMessageValueResponse_MESSAGE:
-		value = msg["message"]
+		value = msg.Message
 		var err error
-		typ, err = parseType(msg["primaryType"].(string), types)
+		typ, err = parseType(msg.PrimaryType, msg.Types)
 		if err != nil {
 			return nil, messages.ETHSignTypedMessageRequest_UNKNOWN, err
 		}
@@ -674,15 +734,33 @@ func getValue(
 	for _, element := range what.Path {
 		switch typ.Type {
 		case messages.ETHSignTypedMessageRequest_STRUCT:
-			structMember := types[typ.StructName].([]interface{})[element].(map[string]interface{})
-			value = value.(map[string]interface{})[structMember["name"].(string)]
+			structMembers := msg.Types[typ.StructName]
+			if uint64(element) >= uint64(len(structMembers)) {
+				return nil, messages.ETHSignTypedMessageRequest_UNKNOWN, errp.New("struct member index out of bounds")
+			}
+			object, ok := value.(map[string]interface{})
+			if !ok {
+				return nil, messages.ETHSignTypedMessageRequest_UNKNOWN, errp.Newf("expected struct value to be an object, got %T", value)
+			}
+			structMember := structMembers[element]
+			value, ok = object[structMember.Name]
+			if !ok {
+				return nil, messages.ETHSignTypedMessageRequest_UNKNOWN, errp.Newf("typed data value %q is missing", structMember.Name)
+			}
 			var err error
-			typ, err = parseType(structMember["type"].(string), types)
+			typ, err = parseType(structMember.Type, msg.Types)
 			if err != nil {
 				return nil, messages.ETHSignTypedMessageRequest_UNKNOWN, err
 			}
 		case messages.ETHSignTypedMessageRequest_ARRAY:
-			value = value.([]interface{})[element]
+			array, ok := value.([]interface{})
+			if !ok {
+				return nil, messages.ETHSignTypedMessageRequest_UNKNOWN, errp.Newf("expected array value, got %T", value)
+			}
+			if uint64(element) >= uint64(len(array)) {
+				return nil, messages.ETHSignTypedMessageRequest_UNKNOWN, errp.New("array index out of bounds")
+			}
+			value = array[element]
 			typ = typ.ArrayType
 		default:
 			return nil, messages.ETHSignTypedMessageRequest_UNKNOWN, errp.New("path element does not point to struct or array")
@@ -724,9 +802,9 @@ func (device *Device) nonAtomicETHSignTypedMessage(
 		return nil, UnsupportedError("9.26.0")
 	}
 
-	var msg map[string]interface{}
-	if err := json.Unmarshal(jsonMsg, &msg); err != nil {
-		return nil, errp.WithStack(err)
+	msg, parsedTypes, err := parseTypedMessage(jsonMsg)
+	if err != nil {
+		return nil, err
 	}
 
 	var hostNonce []byte
@@ -742,33 +820,13 @@ func (device *Device) nonAtomicETHSignTypedMessage(
 		}
 	}
 
-	types := msg["types"].(map[string]interface{})
-	var parsedTypes []*messages.ETHSignTypedMessageRequest_StructType
-	for key, value := range types {
-		var members []*messages.ETHSignTypedMessageRequest_Member
-		for _, member := range value.([]interface{}) {
-			memberS := member.(map[string]interface{})
-			parsedType, err := parseType(memberS["type"].(string), types)
-			if err != nil {
-				return nil, err
-			}
-			members = append(members, &messages.ETHSignTypedMessageRequest_Member{
-				Name: memberS["name"].(string),
-				Type: parsedType,
-			})
-		}
-		parsedTypes = append(parsedTypes, &messages.ETHSignTypedMessageRequest_StructType{
-			Name:    key,
-			Members: members,
-		})
-	}
 	request := &messages.ETHRequest{
 		Request: &messages.ETHRequest_SignTypedMsg{
 			SignTypedMsg: &messages.ETHSignTypedMessageRequest{
 				ChainId:             chainID,
 				Keypath:             keypath,
 				Types:               parsedTypes,
-				PrimaryType:         msg["primaryType"].(string),
+				PrimaryType:         msg.PrimaryType,
 				HostNonceCommitment: hostNonceCommitment,
 			},
 		},

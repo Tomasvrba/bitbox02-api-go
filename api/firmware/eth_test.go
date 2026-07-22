@@ -69,7 +69,7 @@ var eip712Msg = []byte(`
     }
 }`)
 
-func parseTypeNoErr(t *testing.T, typ string, types map[string]interface{}) *messages.ETHSignTypedMessageRequest_MemberType {
+func parseTypeNoErr(t *testing.T, typ string, types map[string][]ethTypedMessageMember) *messages.ETHSignTypedMessageRequest_MemberType {
 	t.Helper()
 	parsed, err := parseType(typ, types)
 	require.NoError(t, err)
@@ -228,9 +228,22 @@ func TestParseType(t *testing.T) {
 			Type:       messages.ETHSignTypedMessageRequest_STRUCT,
 			StructName: "Person",
 		},
-		parseTypeNoErr(t, "Person", map[string]interface{}{"Person": nil}),
+		parseTypeNoErr(t, "Person", map[string][]ethTypedMessageMember{"Person": {}}),
 	)
 
+	_, err = parseType("string]", nil)
+	require.Error(t, err)
+}
+
+func TestParseTypedMessageRejectsMalformedStructure(t *testing.T) {
+	for _, jsonMsg := range []string{
+		`{}`,
+		`{"types":[],"primaryType":"Message","domain":{},"message":{}}`,
+		`{"types":{"EIP712Domain":null},"primaryType":"EIP712Domain","domain":{},"message":{}}`,
+	} {
+		_, _, err := parseTypedMessage([]byte(jsonMsg))
+		require.Error(t, err)
+	}
 }
 
 func TestEncodeValue(t *testing.T) {
@@ -284,6 +297,16 @@ func TestEncodeValue(t *testing.T) {
 	encoded, err = encodeValue(parseTypeNoErr(t, "uint8[]", nil), make([]interface{}, 1000))
 	require.NoError(t, err)
 	require.Equal(t, []byte("\x00\x00\x03\xe8"), encoded)
+
+	for _, test := range []struct {
+		typ   string
+		value interface{}
+	}{
+		{"bytes", true}, {"bool", "true"}, {"string", true}, {"string[]", true},
+	} {
+		_, err := encodeValue(parseTypeNoErr(t, test.typ, nil), test.value)
+		require.Error(t, err, test.typ)
+	}
 }
 
 func TestHandleETHDataStreamingOutOfBounds(t *testing.T) {
@@ -303,7 +326,7 @@ func TestHandleETHDataStreamingOutOfBounds(t *testing.T) {
 }
 
 func TestGetValueReturnsType(t *testing.T) {
-	var msg map[string]interface{}
+	var msg ethTypedMessage
 	require.NoError(t, json.Unmarshal([]byte(`
 {
 	"types": {
@@ -324,7 +347,7 @@ func TestGetValueReturnsType(t *testing.T) {
 	value, dataType, err := getValue(&messages.ETHTypedMessageValueResponse{
 		RootObject: messages.ETHTypedMessageValueResponse_DOMAIN,
 		Path:       []uint32{0},
-	}, msg)
+	}, &msg)
 	require.NoError(t, err)
 	require.Equal(t, []byte("Test"), value)
 	require.Equal(t, messages.ETHSignTypedMessageRequest_STRING, dataType)
@@ -332,10 +355,36 @@ func TestGetValueReturnsType(t *testing.T) {
 	value, dataType, err = getValue(&messages.ETHTypedMessageValueResponse{
 		RootObject: messages.ETHTypedMessageValueResponse_MESSAGE,
 		Path:       []uint32{1},
-	}, msg)
+	}, &msg)
 	require.NoError(t, err)
 	require.Equal(t, []byte{0xaa, 0xbb}, value)
 	require.Equal(t, messages.ETHSignTypedMessageRequest_BYTES, dataType)
+}
+
+func TestGetValueRejectsMalformedValues(t *testing.T) {
+	msg, _, err := parseTypedMessage(eip712Msg)
+	require.NoError(t, err)
+
+	getErr := func(root messages.ETHTypedMessageValueResponse_RootObject, path ...uint32) error {
+		_, _, err := getValue(&messages.ETHTypedMessageValueResponse{RootObject: root, Path: path}, msg)
+		return err
+	}
+
+	msg.Message["from"] = []interface{}{}
+	require.ErrorContains(t, getErr(messages.ETHTypedMessageValueResponse_MESSAGE, 0, 0), "expected struct value to be an object")
+	require.ErrorContains(t, getErr(messages.ETHTypedMessageValueResponse_MESSAGE, 99), "struct member index out of bounds")
+
+	delete(msg.Domain, "chainId")
+	require.ErrorContains(t, getErr(messages.ETHTypedMessageValueResponse_DOMAIN, 2), `typed data value "chainId" is missing`)
+
+	msg.Domain["name"] = float64(1)
+	require.ErrorContains(t, getErr(messages.ETHTypedMessageValueResponse_DOMAIN, 0), "expected string value")
+
+	msg.Message["attachments"] = map[string]interface{}{}
+	require.ErrorContains(t, getErr(messages.ETHTypedMessageValueResponse_MESSAGE, 3, 0), "expected array value")
+
+	msg.Message["attachments"] = []interface{}{}
+	require.ErrorContains(t, getErr(messages.ETHTypedMessageValueResponse_MESSAGE, 3, 0), "array index out of bounds")
 }
 
 func TestETHSignTypedMessageRejectsLargeString(t *testing.T) {
