@@ -470,15 +470,15 @@ func (device *Device) nonAtomicETHSignMessage(
 }
 
 type ethTypedMessageMember struct {
-	Name *string `json:"name"`
-	Type string  `json:"type"`
+	Name string
+	Type string
 }
 
 type ethTypedMessage struct {
-	Types       map[string][]ethTypedMessageMember `json:"types"`
-	PrimaryType *string                            `json:"primaryType"`
-	Domain      map[string]interface{}             `json:"domain"`
-	Message     map[string]interface{}             `json:"message"`
+	Types       map[string][]ethTypedMessageMember
+	PrimaryType string
+	Domain      map[string]interface{}
+	Message     map[string]interface{}
 }
 
 func parseType(typ string, types map[string][]ethTypedMessageMember) (*messages.ETHSignTypedMessageRequest_MemberType, error) {
@@ -575,30 +575,62 @@ func parseType(typ string, types map[string][]ethTypedMessageMember) (*messages.
 }
 
 func parseTypedMessage(jsonMsg []byte) (*ethTypedMessage, []*messages.ETHSignTypedMessageRequest_StructType, error) {
-	var msg ethTypedMessage
-	if err := json.Unmarshal(jsonMsg, &msg); err != nil {
+	var rawMsg map[string]interface{}
+	if err := json.Unmarshal(jsonMsg, &rawMsg); err != nil {
 		return nil, nil, errp.WithStack(err)
 	}
-	if msg.Types == nil || msg.PrimaryType == nil || msg.Domain == nil || msg.Message == nil {
-		return nil, nil, errp.New("typed data is missing required fields")
+
+	rawTypes, typesOK := rawMsg["types"].(map[string]interface{})
+	primaryType, primaryTypeOK := rawMsg["primaryType"].(string)
+	domain, domainOK := rawMsg["domain"].(map[string]interface{})
+	message, messageOK := rawMsg["message"].(map[string]interface{})
+	if !typesOK || !primaryTypeOK || !domainOK || !messageOK {
+		return nil, nil, errp.New("typed data has missing or invalid required fields")
+	}
+
+	msg := &ethTypedMessage{
+		Types:       make(map[string][]ethTypedMessageMember, len(rawTypes)),
+		PrimaryType: primaryType,
+		Domain:      domain,
+		Message:     message,
+	}
+	for name, rawTypeMembers := range rawTypes {
+		typeMembers, ok := rawTypeMembers.([]interface{})
+		if !ok {
+			return nil, nil, errp.New("typed data type members must be an array")
+		}
+		members := make([]ethTypedMessageMember, 0, len(typeMembers))
+		for _, rawMember := range typeMembers {
+			member, ok := rawMember.(map[string]interface{})
+			if !ok {
+				return nil, nil, errp.New("typed data type member must be an object")
+			}
+			memberName, ok := member["name"].(string)
+			if !ok {
+				return nil, nil, errp.New("typed data type member is missing or has invalid name")
+			}
+			memberType, ok := member["type"].(string)
+			if !ok {
+				return nil, nil, errp.New("typed data type member is missing or has invalid type")
+			}
+			members = append(members, ethTypedMessageMember{
+				Name: memberName,
+				Type: memberType,
+			})
+		}
+		msg.Types[name] = members
 	}
 
 	parsedTypes := make([]*messages.ETHSignTypedMessageRequest_StructType, 0, len(msg.Types))
 	for name, typeMembers := range msg.Types {
-		if typeMembers == nil {
-			return nil, nil, errp.New("typed data type members must be an array")
-		}
 		members := make([]*messages.ETHSignTypedMessageRequest_Member, 0, len(typeMembers))
 		for _, member := range typeMembers {
-			if member.Name == nil {
-				return nil, nil, errp.New("typed data type member is missing name")
-			}
 			parsedType, err := parseType(member.Type, msg.Types)
 			if err != nil {
 				return nil, nil, err
 			}
 			members = append(members, &messages.ETHSignTypedMessageRequest_Member{
-				Name: *member.Name,
+				Name: member.Name,
 				Type: parsedType,
 			})
 		}
@@ -607,7 +639,7 @@ func parseTypedMessage(jsonMsg []byte) (*ethTypedMessage, []*messages.ETHSignTyp
 			Members: members,
 		})
 	}
-	return &msg, parsedTypes, nil
+	return msg, parsedTypes, nil
 }
 
 // Golang's stdlib doesn't support serializing signed integers in big endian (two's complement).
@@ -727,7 +759,7 @@ func getValue(
 	case messages.ETHTypedMessageValueResponse_MESSAGE:
 		value = msg.Message
 		var err error
-		typ, err = parseType(*msg.PrimaryType, msg.Types)
+		typ, err = parseType(msg.PrimaryType, msg.Types)
 		if err != nil {
 			return nil, messages.ETHSignTypedMessageRequest_UNKNOWN, err
 		}
@@ -746,9 +778,9 @@ func getValue(
 				return nil, messages.ETHSignTypedMessageRequest_UNKNOWN, errp.Newf("expected struct value to be an object, got %T", value)
 			}
 			structMember := structMembers[element]
-			value, ok = object[*structMember.Name]
+			value, ok = object[structMember.Name]
 			if !ok {
-				return nil, messages.ETHSignTypedMessageRequest_UNKNOWN, errp.Newf("typed data value %q is missing", *structMember.Name)
+				return nil, messages.ETHSignTypedMessageRequest_UNKNOWN, errp.Newf("typed data value %q is missing", structMember.Name)
 			}
 			var err error
 			typ, err = parseType(structMember.Type, msg.Types)
@@ -829,7 +861,7 @@ func (device *Device) nonAtomicETHSignTypedMessage(
 				ChainId:             chainID,
 				Keypath:             keypath,
 				Types:               parsedTypes,
-				PrimaryType:         *msg.PrimaryType,
+				PrimaryType:         msg.PrimaryType,
 				HostNonceCommitment: hostNonceCommitment,
 			},
 		},

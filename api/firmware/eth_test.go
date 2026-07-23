@@ -4,7 +4,6 @@ package firmware
 
 import (
 	"bytes"
-	"encoding/json"
 	"math/big"
 	"testing"
 
@@ -244,10 +243,42 @@ func TestParseTypedMessageRejectsMalformedStructure(t *testing.T) {
 		`{"types":{"EIP712Domain":[]},"primaryType":null,"domain":{},"message":{}}`,
 		`{"types":{"EIP712Domain":[{"type":"string"}]},"primaryType":"EIP712Domain","domain":{},"message":{}}`,
 		`{"types":{"EIP712Domain":[{"name":null,"type":"string"}]},"primaryType":"EIP712Domain","domain":{},"message":{}}`,
+		`{"types":{"EIP712Domain":[null]},"primaryType":"EIP712Domain","domain":{},"message":{}}`,
+		`{"types":{"EIP712Domain":[{"name":"name"}]},"primaryType":"EIP712Domain","domain":{},"message":{}}`,
 	} {
 		_, _, err := parseTypedMessage([]byte(jsonMsg))
 		require.Error(t, err)
 	}
+}
+
+func TestParseTypedMessageUsesExactFieldNames(t *testing.T) {
+	msg, _, err := parseTypedMessage([]byte(`{
+		"types": {
+			"EIP712Domain": [],
+			"Message": [{
+				"name": "value",
+				"Name": "wrongName",
+				"type": "string",
+				"Type": "bytes"
+			}]
+		},
+		"Types": {"Broken": null},
+		"primaryType": "Message",
+		"PrimaryType": "Wrong",
+		"domain": {"name": "expected"},
+		"Domain": {"name": "wrong"},
+		"message": {"value": "expected"},
+		"Message": {"value": "wrong"}
+	}`))
+	require.NoError(t, err)
+	require.Equal(t, "Message", msg.PrimaryType)
+	require.Equal(t, map[string]interface{}{"name": "expected"}, msg.Domain)
+	require.Equal(t, map[string]interface{}{"value": "expected"}, msg.Message)
+	require.Equal(t,
+		[]ethTypedMessageMember{{Name: "value", Type: "string"}},
+		msg.Types["Message"],
+	)
+	require.NotContains(t, msg.Types, "Broken")
 }
 
 func TestEncodeValue(t *testing.T) {
@@ -330,8 +361,7 @@ func TestHandleETHDataStreamingOutOfBounds(t *testing.T) {
 }
 
 func TestGetValueReturnsType(t *testing.T) {
-	var msg ethTypedMessage
-	require.NoError(t, json.Unmarshal([]byte(`
+	msg, _, err := parseTypedMessage([]byte(`
 {
 	"types": {
 		"EIP712Domain": [{ "name": "name", "type": "string" }],
@@ -346,12 +376,13 @@ func TestGetValueReturnsType(t *testing.T) {
 		"contents": "hello",
 		"payload": "0xaabb"
 	}
-}`), &msg))
+}`))
+	require.NoError(t, err)
 
 	value, dataType, err := getValue(&messages.ETHTypedMessageValueResponse{
 		RootObject: messages.ETHTypedMessageValueResponse_DOMAIN,
 		Path:       []uint32{0},
-	}, &msg)
+	}, msg)
 	require.NoError(t, err)
 	require.Equal(t, []byte("Test"), value)
 	require.Equal(t, messages.ETHSignTypedMessageRequest_STRING, dataType)
@@ -359,7 +390,7 @@ func TestGetValueReturnsType(t *testing.T) {
 	value, dataType, err = getValue(&messages.ETHTypedMessageValueResponse{
 		RootObject: messages.ETHTypedMessageValueResponse_MESSAGE,
 		Path:       []uint32{1},
-	}, &msg)
+	}, msg)
 	require.NoError(t, err)
 	require.Equal(t, []byte{0xaa, 0xbb}, value)
 	require.Equal(t, messages.ETHSignTypedMessageRequest_BYTES, dataType)
