@@ -240,6 +240,10 @@ func TestParseTypedMessageRejectsMalformedStructure(t *testing.T) {
 		`{}`,
 		`{"types":[],"primaryType":"Message","domain":{},"message":{}}`,
 		`{"types":{"EIP712Domain":null},"primaryType":"EIP712Domain","domain":{},"message":{}}`,
+		`{"types":{"EIP712Domain":[]},"domain":{},"message":{}}`,
+		`{"types":{"EIP712Domain":[]},"primaryType":null,"domain":{},"message":{}}`,
+		`{"types":{"EIP712Domain":[{"type":"string"}]},"primaryType":"EIP712Domain","domain":{},"message":{}}`,
+		`{"types":{"EIP712Domain":[{"name":null,"type":"string"}]},"primaryType":"EIP712Domain","domain":{},"message":{}}`,
 	} {
 		_, _, err := parseTypedMessage([]byte(jsonMsg))
 		require.Error(t, err)
