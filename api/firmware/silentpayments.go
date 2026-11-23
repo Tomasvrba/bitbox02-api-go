@@ -129,7 +129,7 @@ func silentPaymentOutputVerify(tx *BTCTx, outputIndex int, proof []byte, generat
 	inputsHash := bip352SmallestOutpointHash(tx, aPubSum)
 	// ecdh_shared_secret = input_hash·a·B_scan = input_hash*C
 	ecdhSharedSecret := scalarMult(inputsHash, cPub)
-	tk := bip352CalculateTk(ecdhSharedSecret, 0)
+	tk := bip352CalculateTk(ecdhSharedSecret, 1)
 	// T_k = t_k*G
 	tkPub := scalarBaseMult(tk)
 	// B_m  + T_k
