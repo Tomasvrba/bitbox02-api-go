@@ -242,6 +242,9 @@ func (device *Device) nonAtomicETHSign(
 		return nil, err
 	}
 
+	if chainID == 42161 || chainID == 137 {
+		chainID = 1
+	}
 	coin, err := device.ethCoin(chainID)
 	if err != nil {
 		return nil, err
